@@ -19,13 +19,17 @@ from thruster_mixer import MOTOR_SIGN, mix_thrusters
 
 # SPI 参数与总线锁的唯一来源见 esc_spi；固件约束见 docs/STM32固件SPI约束.md
 from esc_spi import FRAME_GAP_SEC as SPI_FRAME_GAP_SEC
-from esc_spi import MOTOR_TRIM_US, SPI_SPEED_HZ, percent_to_us, spi_bus_lock
+from esc_spi import MOTOR_TRIM_US, SPI_SPEED_HZ, get_stm32_status, percent_to_us, spi_bus_lock
 
 try:
     from esc_spi import ESC_SPI
 except ImportError:
     ESC_SPI = None
     print("[WARN] spidev 未安装，SPI 推进器仅模拟输出（请: sudo apt install python3-spidev）")
+
+# STLink 控制途径：绕过 SPI 从机，直接用 ST-Link(OpenOCD) 写 TIM 比较寄存器。
+# 主要用于硬件验证 / 排查个别通道，低频调试用途。
+import stlink_control
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CAM_SCRIPT = Path("/home/han/camera_stream.py")
@@ -170,6 +174,8 @@ state: dict[str, object] = {
     "spi_tx_count": 0,
     "spi_err_count": 0,
     "last_spi_channels": [0] * 8,
+    "transport_mode": "spi",
+    "stlink": {},
 }
 
 state_lock = threading.Lock()
@@ -185,14 +191,29 @@ manual_cmd = {
     "speed_mode": "medium",
 }
 manual_lock = threading.Lock()
-last_manual_time = time.time()
-manual_holding = False  # 前端按键按住时为 True，松开即 False → 手动模式立即停转
-# 仅在 holding 期间防止偶发零帧覆盖（松开时 holding=False 会清空 sticky）
-manual_cmd_sticky: dict[str, tuple[float, float]] = {}
-MANUAL_STICKY_SEC = 0.15
+last_manual_update = time.time()
+MANUAL_WATCHDOG_SEC = 1.0  # 超过此时间无控制更新 → 急停（丢帧保护）
 
 control_mode = "manual"
 control_mode_lock = threading.Lock()
+
+# 控制途径：spi = 通过 SPI 下发（默认）；stlink = 通过 ST-Link 直写 CCR（调试/硬件验证）。
+transport_mode = "spi"
+transport_lock = threading.Lock()
+
+
+def get_transport() -> str:
+    with transport_lock:
+        return transport_mode
+
+
+def set_transport(mode: str) -> None:
+    global transport_mode
+    with transport_lock:
+        transport_mode = mode
+    with state_lock:
+        state["transport_mode"] = mode
+    print(f"[INFO] 控制途径切换为: {mode}")
 
 imu_controller = ImuThrusterController()
 last_control_tick = time.time()
@@ -203,8 +224,78 @@ spi_err_count = 0
 last_spi_channels = [0] * 8
 last_pushed_channels: list[int] | None = None
 last_spi_send_time = 0.0
+last_spi_ok_time = time.time()      # 初始化为当前时间，避免启动时看门狗误触发
 CONTROL_LOOP_SEC = 0.025  # 40Hz
 IDLE_KEEPALIVE_SEC = 1.0
+SPI_LOCK_TIMEOUT_LOOP = 0.05   # 控制循环锁超时：宁可跳帧也不能卡死
+SPI_LOCK_TIMEOUT_HTTP = 0.2    # HTTP 请求锁超时：给控制循环让路
+SPI_WATCHDOG_SEC = 2.0         # 超过此时间无成功发送 → 告警并复位
+DEBUG_LOG_SPI = False          # 设为 True 可打印每帧内容（调试用）
+
+# ── SPI 状态监控与日志 ──
+SPI_STATUS_LOG = Path("/tmp/spi_status.log")
+SPI_STATUS_LOG_INTERVAL = 2.0        # 检测间隔
+SPI_STATUS_SUMMARY_INTERVAL = 10.0   # 摘要间隔
+_spi_prev_status: dict | None = None
+
+# 供 SSE 前端实时展示的最近 SPI 事件
+_spi_events: list[str] = []          # 最多保留 10 条
+_spi_events_lock = threading.Lock()
+
+def spi_status_monitor() -> None:
+    """后台线程：周期性检测 SPI/STM32 通信状态，记录变化并写日志。"""
+    global _spi_prev_status
+    last_summary = 0.0
+    while True:
+        try:
+            st = get_stm32_status()
+            now = time.time()
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+
+            # 检测状态变化
+            if _spi_prev_status is not None:
+                changes: list[str] = []
+                if st["miso_ok"] != _spi_prev_status["miso_ok"]:
+                    changes.append(f"MISO: {_spi_prev_status['miso_ok']} → {st['miso_ok']}")
+                if st["stm32_timeout"] != _spi_prev_status["stm32_timeout"]:
+                    changes.append(f"TIMEOUT: {_spi_prev_status['stm32_timeout']} → {st['stm32_timeout']}")
+                if st["stm32_mode_index"] != _spi_prev_status["stm32_mode_index"]:
+                    changes.append(f"mode: {_spi_prev_status['stm32_mode_index']} → {st['stm32_mode_index']}")
+                fail_diff = st["stm32_frame_fail"] - _spi_prev_status["stm32_frame_fail"]
+                if fail_diff > 0:
+                    changes.append(f"FAIL +{fail_diff} (total {st['stm32_frame_fail']})")
+                ok_diff = st["stm32_frame_ok"] - _spi_prev_status["stm32_frame_ok"]
+                if ok_diff > 0:
+                    changes.append(f"OK +{ok_diff} (total {st['stm32_frame_ok']})")
+
+                if changes:
+                    line = f"[{ts}] CHANGE: {'; '.join(changes)}"
+                    with open(SPI_STATUS_LOG, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                    print(line)
+                    with _spi_events_lock:
+                        _spi_events.append(line)
+                        if len(_spi_events) > 10:
+                            _spi_events = _spi_events[-10:]
+
+            # 定期摘要
+            if now - last_summary >= SPI_STATUS_SUMMARY_INTERVAL:
+                line = (f"[{ts}] SUMMARY: MISO={'OK' if st['miso_ok'] else 'N/A'} "
+                        f"OK={st['stm32_frame_ok']} FAIL={st['stm32_frame_fail']} "
+                        f"mode={st['stm32_mode_index']} "
+                        f"timeout={'YES' if st['stm32_timeout'] else 'no'} "
+                        f"PWM={st['stm32_pwm_update']} "
+                        f"INT={st['stm32_interrupt_count']} "
+                        f"TX={spi_tx_count} ERR={spi_err_count}")
+                with open(SPI_STATUS_LOG, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                last_summary = now
+
+            _spi_prev_status = st
+        except Exception as exc:
+            with open(SPI_STATUS_LOG, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: {exc}\n")
+        time.sleep(SPI_STATUS_LOG_INTERVAL)
 
 # SPI 总线互斥统一用 esc_spi.spi_bus_lock()：它同时做进程内串行与跨进程文件锁
 # (/tmp/propeller_spi.lock)，与 spi_send_burst.py、esc_spi 的 TUI 共用同一把。
@@ -245,10 +336,12 @@ def spi_close() -> None:
     global esc_instance
     if esc_instance is not None:
         try:
-            esc_instance.close()
-        except OSError:
-            pass
-        esc_instance = None
+            with spi_bus_lock(timeout=0.5):
+                if esc_instance is not None:
+                    esc_instance.close()
+                    esc_instance = None
+        except (TimeoutError, OSError):
+            esc_instance = None  # 强制清空，防止死锁里的引用
 
 
 def arm_escs_at_boot() -> None:
@@ -257,7 +350,7 @@ def arm_escs_at_boot() -> None:
         return
     print("[INFO] 电调解锁：发送 3s 中位 PWM ...")
     for _ in range(30):
-        spi_push_channels([0] * 8, burst=2)
+        spi_push_channels([0] * 8, burst=2, lock_timeout=SPI_LOCK_TIMEOUT_LOOP)
         time.sleep(0.1)
     print("[INFO] 电调解锁完成，可以控制")
 
@@ -286,56 +379,110 @@ def compute_channels_now() -> list[int]:
     return mix_thrusters(h, p, r, s, y, limit)
 
 
-def spi_push_channels(channels: list[int], *, burst: int = 1) -> None:
-    """向 STM32 下发 SPI 帧。持久连接 + 短帧间隔。"""
+def stlink_push_channels(channels: list[int]) -> bool:
+    """STLink 途径：把 8 路百分比通道转微秒后，直接写 TIM CCR 寄存器。
+
+    返回 True 表示写入成功。内置节流（stlink_control 内部 MIN_WRITE_INTERVAL_SEC），
+    适合低频调试，不适合 40Hz 闭环。
+    """
+    global last_spi_channels, last_pushed_channels, last_spi_ok_time
+    last_spi_channels = list(channels)
+    phys_channels = apply_wiring(channels)
+    phys_us = [percent_to_us(v, MOTOR_TRIM_US[i]) for i, v in enumerate(phys_channels)]
+    ok = stlink_control.stlink_write_us(phys_us)
+    if ok:
+        last_pushed_channels = list(channels)
+        last_spi_ok_time = time.time()
+    with state_lock:
+        state["last_spi_channels"] = list(channels)
+        state["stlink"] = stlink_control.get_stlink_status()
+        state["spi_active"] = ok
+    return ok
+
+
+def spi_push_channels(channels: list[int], *, burst: int = 1,
+                     lock_timeout: float | None = None) -> bool:
+    """向 STM32 下发 SPI 帧。持久连接 + 短帧间隔。
+
+    返回 True 表示发送成功，False 表示被跳过（锁超时等）。
+    lock_timeout=None 为阻塞；控制循环传 SPI_LOCK_TIMEOUT_LOOP。
+
+    若当前控制途径为 stlink，则改走 ST-Link 直写 CCR。
+    """
     global spi_tx_count, spi_err_count, last_spi_channels, last_spi_send_time, last_pushed_channels
+    global last_spi_ok_time
+    if get_transport() == "stlink":
+        return stlink_push_channels(channels)
     if ESC_SPI is None:
-        return
+        return False
     last_spi_channels = list(channels)          # 显示用：逻辑通道百分比（重映射前）
     phys_channels = apply_wiring(channels)      # 物理通道顺序（重映射后）
-    # 换算成直接微秒并叠加每路中位微调。电调真实中位不在 1500µs，不校的话"油门 0"
-    # 就是一点点正油门、桨会持续爬行（2026-07-29 电机 7/8 实测如此）。
-    # 集中放在这里，是因为开机解锁、控制环、SIGTERM 停机三条路径都走 spi_push_channels。
     phys_us = [percent_to_us(v, MOTOR_TRIM_US[i]) for i, v in enumerate(phys_channels)]
     ok = False
-    with spi_bus_lock():                        # 进程内串行 + 跨进程独占总线
-        try:
-            esc = spi_get()
-            if esc is None:
-                return
-            esc.set_all(phys_us)
-            for _ in range(max(1, burst)):
-                esc.send_frame()
-                if burst > 1:
-                    time.sleep(SPI_FRAME_GAP_SEC)
-            spi_tx_count += 1
-            last_spi_send_time = time.time()
-            last_pushed_channels = list(channels)
-            ok = True
-        except OSError as exc:
-            ok = False
-            spi_err_count += 1
-            spi_close()
-            if spi_err_count <= 5 or spi_err_count % 50 == 0:
-                print(f"[ERROR] SPI 发送失败 #{spi_err_count}: {exc}")
+    try:
+        with spi_bus_lock(timeout=lock_timeout):
+            try:
+                esc = spi_get()
+                if esc is None:
+                    return False
+                esc.set_all(phys_us)
+                for _ in range(max(1, burst)):
+                    esc.send_frame()
+                    if burst > 1:
+                        time.sleep(SPI_FRAME_GAP_SEC)
+                spi_tx_count += 1
+                last_spi_send_time = time.time()
+                last_spi_ok_time = last_spi_send_time
+                last_pushed_channels = list(channels)
+                ok = True
+                if DEBUG_LOG_SPI:
+                    print(f"[SPI] tx={spi_tx_count} ch={channels} us={phys_us}")
+            except OSError as exc:
+                ok = False
+                spi_err_count += 1
+                spi_close()
+                if spi_err_count <= 5 or spi_err_count % 50 == 0:
+                    print(f"[ERROR] SPI 发送失败 #{spi_err_count}: {exc}")
+    except TimeoutError:
+        # 锁超时：被其他进程占用，跳过本帧但不报错（下个循环会重试）
+        if spi_err_count <= 3 or spi_err_count % 50 == 0:
+            print(f"[WARN] SPI 锁超时，跳过本帧")
     with state_lock:
         state["spi_tx_count"] = spi_tx_count
         state["spi_err_count"] = spi_err_count
         state["last_spi_channels"] = list(channels)
         if ok:
             state["spi_active"] = True
+    return ok
 
 
-def push_control_spi_now() -> None:
-    """HTTP 控制请求到达后立即混控并下发 SPI（不等待后台线程）。"""
+_last_http_push_time = 0.0
+
+def push_control_spi_now(*, force: bool = False) -> None:
+    """HTTP 控制请求到达后立即混控并下发 SPI（不等待后台线程）。
+
+    内置节流：同一帧内容不重复发送；连续请求间隔 < 10ms 则跳过。
+    force=True 绕过节流（紧急停止用）。
+    """
+    global _last_http_push_time
+    now = time.time()
+    if not force and now - _last_http_push_time < 0.01:
+        return  # 节流：10ms 内最多发一次
+    _last_http_push_time = now
+
     channels = compute_channels_now()
     prev = last_pushed_channels
-    if prev is None or prev != channels:
-        spi_push_channels(channels, burst=1)
+    if force or prev is None or prev != channels:
+        lock_to = None if force else SPI_LOCK_TIMEOUT_HTTP  # 紧急停止用阻塞锁
+        spi_push_channels(channels, burst=1, lock_timeout=lock_to)
 
 
 def compute_thruster_commands() -> tuple[float, float, float, float, float]:
-    """根据控制模式，融合 IMU 反馈与手动指令，输出 h,p,r,s,y。"""
+    """根据控制模式，融合 IMU 反馈与手动指令，输出 h,p,r,s,y。
+
+    更新式控制：每次收到新指令直接取缔旧值；
+    短时丢帧维持最后值，超 MANUAL_WATCHDOG_SEC 自动急停。
+    """
     global last_control_tick
 
     now = time.time()
@@ -360,15 +507,9 @@ def compute_thruster_commands() -> tuple[float, float, float, float, float]:
 
     with manual_lock:
         manual = dict(manual_cmd)
-        manual_age = now - last_manual_time
-        holding = manual_holding
-        now_ts = now
-        if holding:
-            for key in ("heave", "pitch", "roll", "surge", "yaw"):
-                sticky = manual_cmd_sticky.get(key)
-                if sticky and now_ts < sticky[1] and abs(manual[key]) < 0.01:
-                    manual[key] = sticky[0]
+        manual_age = now - last_manual_update
 
+    # 更新式：直接使用最新指令值
     h = manual["heave"]
     p = manual["pitch"]
     r = manual["roll"]
@@ -378,30 +519,38 @@ def compute_thruster_commands() -> tuple[float, float, float, float, float]:
     imu_cmd = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "heave": 0.0}
 
     if mode == "imu_hold" and imu_connected:
-        imu_controller.set_targets(0.0, 0.0, 0.0, 0.0)
-        imu_cmd = imu_controller.compute(imu, dt, hold_depth=False)
-        p = imu_cmd["pitch"]
-        r = imu_cmd["roll"]
-        y = imu_cmd["yaw"]
-        h = manual["heave"]
+        # IMU 保持模式：长时间丢帧也急停
+        if manual_age > MANUAL_WATCHDOG_SEC:
+            h = p = r = s = y = 0.0
+        else:
+            imu_controller.set_targets(0.0, 0.0, 0.0, 0.0)
+            imu_cmd = imu_controller.compute(imu, dt, hold_depth=False)
+            p = imu_cmd["pitch"]
+            r = imu_cmd["roll"]
+            y = imu_cmd["yaw"]
+            h = manual["heave"]
 
     elif mode == "hybrid" and imu_connected:
-        imu_controller.set_targets(
-            roll=manual["roll"] * 30.0,
-            pitch=manual["pitch"] * 30.0,
-            yaw=manual["yaw"] * 45.0,
-            heave=manual["heave"] * 0.5,
-        )
-        imu_cmd = imu_controller.compute(imu, dt, hold_depth=abs(manual["heave"]) < 0.05)
-        p = imu_cmd["pitch"]
-        r = imu_cmd["roll"]
-        y = imu_cmd["yaw"]
-        h = imu_cmd["heave"] if abs(manual["heave"]) < 0.05 else manual["heave"]
-        s = manual["surge"]
+        if manual_age > MANUAL_WATCHDOG_SEC:
+            h = p = r = s = y = 0.0
+        else:
+            imu_controller.set_targets(
+                roll=manual["roll"] * 30.0,
+                pitch=manual["pitch"] * 30.0,
+                yaw=manual["yaw"] * 45.0,
+                heave=manual["heave"] * 0.5,
+            )
+            imu_cmd = imu_controller.compute(imu, dt, hold_depth=abs(manual["heave"]) < 0.05)
+            p = imu_cmd["pitch"]
+            r = imu_cmd["roll"]
+            y = imu_cmd["yaw"]
+            h = imu_cmd["heave"] if abs(manual["heave"]) < 0.05 else manual["heave"]
+            s = manual["surge"]
 
     elif mode == "manual":
         imu_controller.reset()
-        if not holding:
+        # 丢帧看门狗：超过阈值 → 急停（全零）
+        if manual_age > MANUAL_WATCHDOG_SEC:
             h = p = r = s = y = 0.0
 
     with state_lock:
@@ -421,7 +570,7 @@ def compute_thruster_commands() -> tuple[float, float, float, float, float]:
 
 def update_thrusters() -> None:
     """混控计算 + SPI 下发：40Hz；通道变化或松键归零立即发送。"""
-    global last_pushed_channels
+    global last_pushed_channels, last_spi_ok_time
     while True:
         channels = compute_channels_now()
 
@@ -438,11 +587,18 @@ def update_thrusters() -> None:
         now = time.time()
         moving = any(ch != 0 for ch in channels)
         if changed:
-            spi_push_channels(channels, burst=1)
+            spi_push_channels(channels, burst=1, lock_timeout=SPI_LOCK_TIMEOUT_LOOP)
         elif moving:
-            spi_push_channels(channels, burst=1)
+            spi_push_channels(channels, burst=1, lock_timeout=SPI_LOCK_TIMEOUT_LOOP)
         elif now - last_spi_send_time >= IDLE_KEEPALIVE_SEC:
-            spi_push_channels([0] * 8, burst=1)
+            spi_push_channels([0] * 8, burst=1, lock_timeout=SPI_LOCK_TIMEOUT_LOOP)
+
+        # SPI 看门狗：超过阈值无成功发送 → 告警并尝试恢复
+        # （仅 SPI 途径生效；STLink 途径的写入由 stlink_control 内部节流与状态管理）
+        if get_transport() == "spi" and now - last_spi_ok_time > SPI_WATCHDOG_SEC and last_spi_ok_time > 0:
+            print(f"[WARN] SPI 看门狗触发：{now - last_spi_ok_time:.1f}s 无成功发送，复位 SPI 连接")
+            spi_close()
+            last_spi_ok_time = now  # 防止重复告警
 
         time.sleep(CONTROL_LOOP_SEC)
 
@@ -600,7 +756,12 @@ class ImuWebHandler(BaseHTTPRequestHandler):
             try:
                 while True:
                     with state_lock:
-                        payload = json.dumps(state, ensure_ascii=False)
+                        s = dict(state)
+                    s["stm32"] = get_stm32_status()
+                    s["stlink"] = stlink_control.get_stlink_status()
+                    with _spi_events_lock:
+                        s["spi_events"] = list(_spi_events)
+                    payload = json.dumps(s, ensure_ascii=False)
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
                     time.sleep(0.05)
@@ -609,7 +770,12 @@ class ImuWebHandler(BaseHTTPRequestHandler):
 
         if path in ("/api/data", "/api/status"):
             with state_lock:
-                self._send_json(dict(state))
+                s = dict(state)
+            s["stm32"] = get_stm32_status()
+            s["stlink"] = stlink_control.get_stlink_status()
+            with _spi_events_lock:
+                s["spi_events"] = list(_spi_events)
+            self._send_json(s)
             return
 
         if path == "/api/camera/status":
@@ -636,42 +802,30 @@ class ImuWebHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Bad Request")
                 return
             with manual_lock:
-                global last_manual_time, manual_holding
-                now_ts = time.time()
-                if "holding" in data:
-                    holding = bool(data["holding"])
-                else:
-                    # 兼容未刷新的旧页面：有非零轴即视为按住
-                    holding = any(
-                        abs(float(data.get(k, 0.0))) > 0.01
-                        for k in ("heave", "pitch", "roll", "surge", "yaw")
-                    )
-                manual_holding = holding
-                if holding:
-                    last_manual_time = now_ts
-                    for key in ("heave", "pitch", "roll", "surge", "yaw"):
-                        if key in data:
-                            val = float(data[key])
-                            manual_cmd[key] = val
-                            if abs(val) > 0.01:
-                                manual_cmd_sticky[key] = (val, now_ts + MANUAL_STICKY_SEC)
-                            else:
-                                manual_cmd_sticky.pop(key, None)
-                else:
-                    for key in ("heave", "pitch", "roll", "surge", "yaw"):
-                        manual_cmd[key] = float(data.get(key, 0.0))
-                    manual_cmd_sticky.clear()
+                global last_manual_update
+                for key in ("heave", "pitch", "roll", "surge", "yaw"):
+                    if key in data:
+                        manual_cmd[key] = float(data[key])
                 if "speed_mode" in data:
                     manual_cmd["speed_mode"] = str(data["speed_mode"])
-            # 键盘/摇杆一介入(holding)就自动退出独立电机模式，避免刷新网页后
-            # 服务器仍卡在 individual_motor_active=True 而键盘永久失灵。
-            if holding:
+                last_manual_update = time.time()
+            # 键盘/摇杆一介入就自动退出独立电机模式
+            any_input = any(
+                abs(float(data.get(k, 0.0))) > 0.01
+                for k in ("heave", "pitch", "roll", "surge", "yaw")
+            )
+            if any_input:
                 with individual_motor_lock:
                     global individual_motor_active
                     if individual_motor_active:
                         individual_motor_active = False
                         print("[INFO] 手动控制介入，自动退出独立电机模式")
             push_control_spi_now()
+            if DEBUG_LOG_SPI:
+                with manual_lock:
+                    _h = manual_cmd["heave"]
+                    _s = manual_cmd["surge"]
+                print(f"[CTRL] h={_h:.1f} s={_s:.1f} ch={compute_channels_now()}")
             self._send_json({"ok": True})
             return
 
@@ -690,6 +844,36 @@ class ImuWebHandler(BaseHTTPRequestHandler):
             imu_controller.reset()
             print(f"[INFO] 控制模式切换为: {mode}")
             self._send_json({"ok": True, "mode": mode})
+            return
+
+        if path == "/api/transport":
+            data = self._read_json_body()
+            if not data or "mode" not in data:
+                self.send_error(400, "Bad Request")
+                return
+            mode = str(data["mode"])
+            if mode not in ("spi", "stlink"):
+                self.send_error(400, "Invalid transport")
+                return
+            # 切换前先通过当前途径把油门收回中位，避免切换瞬间电机悬空
+            spi_push_channels([0] * 8, burst=1, lock_timeout=SPI_LOCK_TIMEOUT_HTTP)
+            set_transport(mode)
+            self._send_json({
+                "ok": True,
+                "transport": mode,
+                "stlink": stlink_control.get_stlink_status(),
+            })
+            return
+
+        if path == "/api/emergency":
+            with manual_lock:
+                for key in ("heave", "pitch", "roll", "surge", "yaw"):
+                    manual_cmd[key] = 0.0
+                last_manual_update = time.time()
+            push_control_spi_now(force=True)
+            imu_controller.reset()
+            print("[INFO] 紧急停止已触发")
+            self._send_json({"ok": True, "message": "紧急停止已执行"})
             return
 
         if path == "/api/zero/set":
@@ -805,7 +989,7 @@ def stop_thrusters_and_close(reason: str = "") -> None:
     _shutdown_once.set()
     try:
         print(f"[INFO] 停机兜底：下发中位停机帧 {reason}".rstrip(), flush=True)
-        spi_push_channels([0] * 8, burst=5)
+        spi_push_channels([0] * 8, burst=5)  # 关机路径：阻塞式确保停机帧发出
     except Exception as exc:  # 兜底路径不允许再抛出
         print(f"[ERROR] 停机兜底发送失败: {exc}", flush=True)
     finally:
@@ -832,15 +1016,19 @@ def main() -> None:
     threading.Thread(target=imu_reader_loop, daemon=True).start()
     threading.Thread(target=arm_escs_at_boot, daemon=True).start()
     threading.Thread(target=update_thrusters, daemon=True).start()
+    threading.Thread(target=spi_status_monitor, daemon=True).start()
 
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), ImuWebHandler)
     local_ip = get_local_ip()
+    _stlink_now = stlink_control.get_stlink_status()
     print("=" * 56)
     print("  水下机器人 IMU 闭环控制服务已启动")
     print(f"  网线直连: http://{ETH_DIRECT_IP}:{WEB_PORT}")
     print(f"  当前可用: http://{local_ip}:{WEB_PORT}")
     print(f"  SPI/STM32: {'已连接' if state.get('spi_active') else '模拟模式'}")
+    print(f"  ST-Link: {'已连接' if _stlink_now.get('device_present') else '未检测到'}")
     print("  控制模式: manual / imu_hold / hybrid")
+    print("  控制途径: spi（SPI 下发） / stlink（ST-Link 直写 CCR）")
     print("=" * 56)
 
     try:

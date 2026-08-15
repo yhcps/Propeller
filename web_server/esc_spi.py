@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""树莓派 → STM32F103C8T6 的 8 路 ESC 油门 SPI 下发。
+"""树莓派 → STM32F103C8T6 的 8 路 ESC 油门 SPI 下发（全双工，带 MISO 状态回读）。
 
 ═══════════════ 固件事实（已烧录、不可改动，本模块据此适配）═══════════════
 来源：STM32 工程 My_Core/{spi_slave.c, esc_spi.c} + App.c，详见 docs/STM32固件SPI约束.md
 
   * STM32 = SPI2 从机；**mode 0**(CPOL=0,CPHA=0)；MSB first；8 bit；硬件 NSS(PB12 低有效)。
-  * 方向 = SPI_DIRECTION_2LINES_RXONLY，PB14(MISO) 被配成浮空输入 —— STM32 **从不驱动 MISO**。
-      >>> 所以 xfer2 的读回全是悬空噪声，绝不能用来判断链路是否通。<<<
+  * 全双工模式：MOSI 下发 26 字节控制帧，MISO 同时回读 26 字节状态帧。
   * 固件预挂"恰好 26 字节"的中断接收，收满即校验；`spi_validate_frame` **只认帧头在第 0 字节**，
     重对齐视图 build_aligned_view() 仅供调试，不进 ESC 更新路径。
       >>> 所以 Pi 必须"一次 xfer2 恰好一帧 26 字节"，帧间留 ≥数百 µs 间隔。<<<
@@ -23,6 +22,21 @@
     [3..18]  8 × int16_t 小端
     [19..24] 6 × 0x00 填充
     [25]     CRC8（多项式 0x07，初值 0，无反射无异或，覆盖前 25 字节）
+
+MISO 回读状态帧（26 字节）：
+    [0]     0xAA          帧头
+    [1]     0x02          状态回传命令
+    [2]     16            DATA_LEN
+    [3..4]  uint16 LE     spi_validate_ok_count (低 16 位)
+    [5..6]  uint16 LE     spi_validate_fail_count (低 16 位)
+    [7..8]  int16 LE      throttle[0] 回读
+    [9..10] int16 LE      throttle[1] 回读
+    [11..12] uint16 LE    spi_interrupt_count (低 16 位)
+    [13..14] uint16 LE    标志位: bit0=frame_valid, bit1=crc_ok, bit8=timeout_active
+    [15..16] uint16 LE    spi_mode_index
+    [17..18] uint16 LE    spi_pwm_update_count (低 16 位)
+    [19..24] 6×0x00      填充
+    [25]     CRC8
 
 通道值语义（固件 ESC_ApplyToPWM）：
     -100 ≤ v ≤ 100 → 百分比，us = 1500 + v*5（-100→1000us，0→1500us 停，+100→2000us）
@@ -91,7 +105,7 @@ _lock_guard = threading.RLock()  # 进程内串行；RLock 使同线程嵌套获
 
 
 @contextmanager
-def spi_bus_lock():
+def spi_bus_lock(timeout: float | None = None):
     """独占 SPI 总线（进程内 + 跨进程）。
 
     所有向 /dev/spidev0.0 发帧的代码都必须包在这里面。历史教训：守护进程与测试
@@ -99,6 +113,9 @@ def spi_bus_lock():
     切一次 SPI 模式 → 与 Pi 固定的 mode 0 永久错位，全部电机不转且无法自愈。
 
     可重入：同一进程内嵌套获取只在最外层真正上锁/解锁，避免自锁。
+
+    timeout: 若指定（秒），在超时内无法获取锁则抛出 TimeoutError。
+             控制循环应传 timeout=0.05 来避免长期阻塞；HTTP 请求可传 timeout=0.1。
     """
     global _lock_fh, _lock_depth
     with _lock_guard:
@@ -106,7 +123,20 @@ def spi_bus_lock():
             if _lock_fh is None:
                 SPI_LOCK_FILE.touch(exist_ok=True)
                 _lock_fh = SPI_LOCK_FILE.open("w")
-            fcntl.flock(_lock_fh, fcntl.LOCK_EX)
+            if timeout is None:
+                fcntl.flock(_lock_fh, fcntl.LOCK_EX)
+            else:
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"SPI 总线锁获取超时 ({timeout:.2f}s)，可能有其他进程占用"
+                            )
+                        time.sleep(0.001)
         _lock_depth += 1
         try:
             yield
@@ -128,6 +158,58 @@ def crc8(data) -> int:
             else:
                 crc = (crc << 1) & 0xFF
     return crc
+
+
+# ──────────────── STM32 MISO 状态回读 ────────────────
+# 由 send_frame() 在每次 SPI 传输后更新，imu_web_server 通过 get_stm32_status() 读取
+_stm32_status = {
+    "miso_ok": False,           # 最近一次 MISO 是否解析成功
+    "stm32_frame_ok": 0,        # STM32 帧校验成功次数
+    "stm32_frame_fail": 0,      # STM32 帧校验失败次数
+    "stm32_interrupt_count": 0, # STM32 SPI 中断计数
+    "stm32_pwm_update": 0,      # STM32 PWM 更新次数
+    "stm32_mode_index": 0,      # STM32 SPI 模式索引 (0=CPOL0/CPHA0)
+    "stm32_timeout": False,     # STM32 超时标志
+    "stm32_flags": 0,           # 原始标志位
+    "throttle_readback": [0] * 2,  # 油门[0..1] 回读
+}
+
+
+def _le16(data: bytes, offset: int) -> int:
+    """小端 uint16 解码，带符号扩展（int16→int）。"""
+    raw = data[offset] | (data[offset + 1] << 8)
+    if raw & 0x8000:
+        return raw - 0x10000
+    return raw
+
+
+def parse_stm32_miso(data: bytes):
+    """解析 26 字节 MISO 状态帧，更新 _stm32_status。返回 True 表示成功。"""
+    if len(data) < 26:
+        _stm32_status["miso_ok"] = False
+        return False
+    if data[0] != 0xAA or data[1] != 0x02:
+        _stm32_status["miso_ok"] = False
+        return False
+    if crc8(data[:25]) != data[25]:
+        _stm32_status["miso_ok"] = False
+        return False
+
+    _stm32_status["miso_ok"] = True
+    _stm32_status["stm32_frame_ok"] = data[3] | (data[4] << 8)
+    _stm32_status["stm32_frame_fail"] = data[5] | (data[6] << 8)
+    _stm32_status["throttle_readback"] = [_le16(data, 7), _le16(data, 9)]
+    _stm32_status["stm32_interrupt_count"] = data[11] | (data[12] << 8)
+    _stm32_status["stm32_flags"] = data[13] | (data[14] << 8)
+    _stm32_status["stm32_mode_index"] = data[15] | (data[16] << 8)
+    _stm32_status["stm32_pwm_update"] = data[17] | (data[18] << 8)
+    _stm32_status["stm32_timeout"] = bool(_stm32_status["stm32_flags"] & 0x100)
+    return True
+
+
+def get_stm32_status():
+    """返回 STM32 MISO 回读状态的快照。"""
+    return dict(_stm32_status)
 
 
 def validate_channel_value(value) -> int:
@@ -231,26 +313,20 @@ class ESC_SPI:
         return frame
 
     def send_frame(self, channels=None):
-        """一次 xfer2 恰好下发一帧 26 字节。
-
-        注意：不在这里上锁 —— 调用方（守护进程 / 测试脚本）负责用 spi_bus_lock()
-        把一整轮发送包起来，避免逐帧反复抢锁。
-        返回构造出的帧；xfer2 的读回是悬空噪声，直接丢弃。
+        """一次 xfer2 全双工传输 26 字节帧。
+        发送 MOSI 控制帧，同时读取 MISO 状态帧并解析 STM32 反馈。
         """
         if channels is None:
             channels = self.channels
         frame = self.build_frame(channels)
-        self.spi.xfer2(list(frame))
+        miso_raw = bytes(self.spi.xfer2(list(frame)))
+        parse_stm32_miso(miso_raw)
         return frame
 
     @staticmethod
     def parse_frame(data: bytes):
         """★仅供离线自检：把一段字节按本协议解回 8 个通道值。
-
-        ⚠ 绝不可用于判断链路是否连通。固件是 RXONLY 且不驱动 MISO，
-        xfer2 的读回是悬空噪声；历史上就因为拿读回当回执而长期误判。
-        链路确认只能靠 ST-Link 读 spi_validate_ok_count / debug_esc_throttles，
-        或直接观察电调自检音与电机反应。
+        链路状态请用 get_stm32_status() 读取 MISO 回读。
         """
         if not data:
             return None, "no data"
@@ -352,8 +428,10 @@ def draw_screen(stdscr, esc, selected, sent, hz):
 
     add_line(0, 0, "ESC SPI 控制面板 (q 退出, 1-8 选通道, ↑↓ 切通道, ←→ ±1%, c 全停)")
     add_line(1, 0, f"SPI: {esc.describe()} | {hz:.0f}Hz | 已发 {sent} 帧")
-    add_line(2, 0, "★ 固件不驱动 MISO，读回是噪声，无法从软件确认链路；")
-    add_line(3, 0, "  是否真的通请看电调自检音/电机，或 ST-Link 读 spi_validate_ok_count。")
+    st = get_stm32_status()
+    add_line(2, 0, f"STM32: OK={st['stm32_frame_ok']} FAIL={st['stm32_frame_fail']} "
+             f"INT={st['stm32_interrupt_count']} PWM={st['stm32_pwm_update']} "
+             f"mode={st['stm32_mode_index']} miso={'OK' if st['miso_ok'] else 'N/A'}")
     add_line(4, 0, f"当前选中通道: {selected + 1}")
     add_line(5, 0, "发送通道值:")
     for idx, value in enumerate(esc.channels):

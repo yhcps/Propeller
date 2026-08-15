@@ -74,6 +74,17 @@
       touch-action: none;
     }
     .key.active { background: var(--primary); color: #000; border-color: var(--primary); box-shadow: 0 0 12px rgba(56,189,248,0.5); }
+    .key.estop { background: var(--danger); color: #fff; font-weight: bold; font-size: 0.9rem; min-width: 100px; letter-spacing: 1px; }
+    .key.estop:active, .key.estop.active { background: #ff6666; box-shadow: 0 0 16px rgba(239,68,68,0.6); }
+    @keyframes escFlash {
+      0%, 100% { background: var(--danger); box-shadow: 0 0 8px rgba(239,68,68,0.4); }
+      50% { background: #ff6666; box-shadow: 0 0 20px rgba(239,68,68,0.8); transform: scale(1.08); }
+    }
+    .key.esc-flash { animation: escFlash 0.25s ease-in-out 3; }
+    .spi-indicator { font-size: 0.8rem; padding: 8px 10px; border-radius: 8px; background: rgba(0,0,0,0.2); margin-top: 8px; line-height: 1.6; }
+    .spi-indicator .spi-ok { color: var(--success); }
+    .spi-indicator .spi-warn { color: #f59e0b; }
+    .spi-indicator .spi-err { color: var(--danger); }
     .key.wide { min-width: 120px; }
     .key-label { font-size: 0.7rem; color: var(--text-muted); text-align: center; margin-top: 4px; }
     .key-group { text-align: center; }
@@ -103,6 +114,21 @@
   <div class="left-col">
     <div class="card" style="margin-bottom: 15px;">
       <h2><div class="status-dot" id="status-dot"></div> <span id="status-text">连接中...</span></h2>
+      <div class="spi-indicator" id="spi-indicator">
+        SPI: <span id="spi-state">检查中...</span><br>
+        STM32: <span id="stm32-state">等待数据</span><br>
+        <span id="spi-events" style="display:none;font-size:0.72rem;color:var(--text-muted);"></span>
+      </div>
+
+      <h3 style="font-size: 0.9rem; margin: 12px 0 6px; color: var(--text-muted);">控制途径</h3>
+      <div class="mode-btns" id="transport-group">
+        <button class="mode-btn active" data-transport="spi">SPI 通道</button>
+        <button class="mode-btn" data-transport="stlink">ST-Link 调试</button>
+      </div>
+      <div class="pid-info" id="transport-info">
+        途径: <span id="transport-state">SPI</span>（40Hz 闭环）<br>
+        ST-Link: <span id="stlink-state">检测中...</span>
+      </div>
       <div id="scene-wrap">
         <canvas id="scene"></canvas>
       </div>
@@ -177,10 +203,16 @@
             <div class="key-group"><div class="key" data-key="ArrowRight">&rarr;</div><div class="key-label">右倾 Roll</div></div>
           </div>
         </div>
+        <div class="key-row" style="margin-top:8px; justify-content:center;">
+          <div class="key-group">
+            <div class="key estop" data-key="Escape">ESC</div>
+            <div class="key-label" style="color:var(--danger);">紧急停止</div>
+          </div>
+        </div>
         <div class="info-text" style="margin-top:14px">
           布局：1–6 升沉Z（前排1/6）| 7–8 水平前进/转向<br>
-          按住屏幕按键或键盘持续控制，松开即停<br>
-          数字键 <b>1</b> 慢速 &middot; <b>2</b> 中速 &middot; <b>3</b> 快速 &middot; <b>空格</b> 紧急停止
+          Esc 紧急停止 · 数字 1/2/3 调速 · 松键即停<br>
+          丢帧保护：1s 无数据自动急停
         </div>
       </div>
 
@@ -339,10 +371,8 @@
   const ids = ["roll", "pitch", "yaw"];
   const displayValues = { roll: 0, pitch: 0, yaw: 0 };
   let currentProfile = "A";
-  let ctrlState = { heave: 0, pitch: 0, roll: 0, surge: 0, yaw: 0, speed_mode: 'medium', control_mode: 'manual', holding: false };
-  let releaseBurstUntil = 0;
-  const CONTROL_HZ_MS = 25;      // 40Hz 前端上报
-  const RELEASE_BURST_MS = 150;  // 松键后短 burst，够覆盖 1~2 个后端周期
+  let ctrlState = { heave: 0, pitch: 0, roll: 0, surge: 0, yaw: 0, speed_mode: 'medium', control_mode: 'manual' };
+  const KEEPALIVE_MS = 500;  // 保活间隔：防止 1s 丢帧看门狗误触发
 
   const modeLabels = {
     manual: "手动控制",
@@ -370,6 +400,58 @@
       `模式: <b>${modeLabels[mode] || mode}</b><br>` +
       `PID输出 Roll=${(data.imu_cmd_roll||0).toFixed(3)} Pitch=${(data.imu_cmd_pitch||0).toFixed(3)} Yaw=${(data.imu_cmd_yaw||0).toFixed(3)}<br>` +
       `SPI: ${data.spi_active ? '已连接STM32' : '模拟(未接SPI)'}`;
+
+    // SPI 状态指示灯
+    const spiEl = document.getElementById('spi-state');
+    const stm32El = document.getElementById('stm32-state');
+    const evtEl = document.getElementById('spi-events');
+    if (spiEl && stm32El && data.stm32) {
+      const st = data.stm32;
+      const tx = data.spi_tx_count || 0;
+      const err = data.spi_err_count || 0;
+      if (data.spi_active) {
+        const errClass = err > 0 ? 'spi-warn' : 'spi-ok';
+        spiEl.innerHTML = `<span class="spi-ok">已连接</span> TX:<b>${tx}</b> <span class="${errClass}">ERR:${err}</span>`;
+        const misoClass = st.miso_ok ? 'spi-ok' : 'spi-warn';
+        const timeoutStr = st.stm32_timeout ? '<span class="spi-err"> TIMEOUT!</span>' : '';
+        const failStr = st.stm32_frame_fail > 0 ? `<span class="spi-warn"> FAIL:${st.stm32_frame_fail}</span>` : '';
+        stm32El.innerHTML =
+          `<span class="${misoClass}">MISO:${st.miso_ok ? 'OK' : 'N/A'}</span> ` +
+          `OK:${st.stm32_frame_ok}${failStr} ` +
+          `mode:${st.stm32_mode_index}${timeoutStr} ` +
+          `PWM:${st.stm32_pwm_update}`;
+      } else {
+        spiEl.innerHTML = '<span class="spi-err">未连接</span>';
+        stm32El.innerHTML = '<span class="spi-warn">SPI 设备不可用</span>';
+      }
+      // 最近事件
+      if (evtEl && data.spi_events && data.spi_events.length > 0) {
+        const last = data.spi_events[data.spi_events.length - 1];
+        evtEl.style.display = 'block';
+        evtEl.textContent = last;
+      }
+    }
+
+    // 控制途径（SPI / ST-Link）状态
+    const transport = data.transport_mode || 'spi';
+    document.querySelectorAll('#transport-group .mode-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.transport === transport);
+    });
+    const tStateEl = document.getElementById('transport-state');
+    if (tStateEl) tStateEl.textContent = transport === 'stlink' ? 'ST-Link' : 'SPI';
+    const stLinkStateEl = document.getElementById('stlink-state');
+    if (stLinkStateEl) {
+      const sl = data.stlink || {};
+      if (sl.device_present) {
+        const okText = sl.last_ok ? '已连接' : '设备在线(待写入)';
+        stLinkStateEl.innerHTML = `<span class="spi-ok">${okText}</span>`;
+        if (sl.last_error) {
+          stLinkStateEl.innerHTML += ` <span class="spi-warn">${sl.last_error}</span>`;
+        }
+      } else {
+        stLinkStateEl.innerHTML = '<span class="spi-warn">未检测到 ST-Link</span>';
+      }
+    }
 
     currentProfile = data.active_zero_profile;
     document.querySelectorAll('#zero-select-group .btn').forEach(b => {
@@ -430,6 +512,17 @@
     });
   });
 
+  // Control transport (SPI / ST-Link)
+  document.querySelectorAll('#transport-group .mode-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      fetch('/api/transport', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: btn.dataset.transport }),
+      }).catch(e => {});
+    });
+  });
+
   // Keyboard control
   const pressedKeys = new Set();
   const keyPanel = document.getElementById("keyboard-panel");
@@ -465,27 +558,27 @@
     ctrlState.pitch = pitch;
     ctrlState.roll = roll;
     ctrlState.heave = heave;
-    ctrlState.holding = pressedKeys.size > 0;
 
     ctrlDisplay.textContent =
       `Surge:${surge.toFixed(1)} Roll:${roll.toFixed(1)} Pitch:${pitch.toFixed(1)} Yaw:${yaw.toFixed(1)} Heave:${heave.toFixed(1)}` +
-      (ctrlState.holding ? ' [按住]' : ' [停止]');
+      (pressedKeys.size > 0 ? ' [按住]' : ' [停止]');
     updateKeyHighlights();
-    sendControl(true);
-  }
-
-  function markReleased() {
-    if (pressedKeys.size === 0) {
-      releaseBurstUntil = Date.now() + RELEASE_BURST_MS;
-    }
+    sendControl();
   }
 
   function emergencyStop() {
     pressedKeys.clear();
     ctrlState.heave = ctrlState.pitch = ctrlState.roll = ctrlState.surge = ctrlState.yaw = 0;
-    ctrlState.holding = false;
-    releaseBurstUntil = Date.now() + RELEASE_BURST_MS;
     applyKeyboardToCtrl();
+    // 额外调用专用紧急停止端点，绕过后端节流
+    fetch('/api/emergency', { method: 'POST' }).catch(() => {});
+    // ESC 按键动画
+    const escKey = document.querySelector('.key.estop');
+    if (escKey) {
+      escKey.classList.remove('esc-flash');
+      void escKey.offsetWidth;
+      escKey.classList.add('esc-flash');
+    }
   }
 
   function onKeyDown(e) {
@@ -494,7 +587,7 @@
     }
     if (e.repeat) return;
 
-    if (e.code === "Space") {
+    if (e.code === "Escape") {
       emergencyStop();
       return;
     }
@@ -512,7 +605,6 @@
     if (pressedKeys.has(e.code)) {
       pressedKeys.delete(e.code);
       applyKeyboardToCtrl();
-      markReleased();
     }
   }
 
@@ -534,20 +626,24 @@
       e.preventDefault();
       if (e.pointerType === "mouse" && e.button !== 0) return;
       el.setPointerCapture(e.pointerId);
+      if (code === "Escape") {
+        emergencyStop();
+        return;
+      }
       pressControlKey(code);
     });
     const release = (e) => {
       if (el.hasPointerCapture(e.pointerId)) {
         el.releasePointerCapture(e.pointerId);
       }
+      if (code === "Escape") return;
       releaseControlKey(code);
-      markReleased();
     };
     el.addEventListener("pointerup", release);
     el.addEventListener("pointercancel", release);
     el.addEventListener("lostpointercapture", () => {
+      if (code === "Escape") return;
       releaseControlKey(code);
-      markReleased();
     });
   });
 
@@ -587,16 +683,10 @@
     }).catch(e => {});
   }
 
-  function hasActiveControl() {
-    return pressedKeys.size > 0 || Date.now() < releaseBurstUntil;
-  }
-
-  // 按住/松键 40Hz 上报；后端收到后立即 SPI 下发
+  // 更新式控制：按键变化时发送，500ms 保活(force)防看门狗误触发
   setInterval(() => {
-    if (hasActiveControl()) {
-      sendControl(true);
-    }
-  }, CONTROL_HZ_MS);
+    sendControl(true);
+  }, KEEPALIVE_MS);
 
   document.querySelectorAll('.speed-btn').forEach(btn => {
     btn.addEventListener('click', () => setSpeedMode(btn.dataset.speed));
