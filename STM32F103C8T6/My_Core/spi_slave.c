@@ -51,23 +51,14 @@ void SPI_Slave_Init(void)
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-     /* SPI2 slave input pins: NSS, SCK, MOSI are inputs to the peripheral.
-         On STM32F1, these are best configured as GPIO input mode with the correct pull-up/down. */
-     GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_15; /* SCK, MOSI */
-     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-     GPIO_InitStruct.Pull = GPIO_NOPULL;
-     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    /* Configure PB12 (NSS) as input (idle high). We no longer rely on EXTI to start transfers. */
-    GPIO_InitStruct.Pin = GPIO_PIN_12; /* NSS */
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP; /* idle high */
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-    /* MISO PB14 not used in RX-only mode; keep as input floating */
-    GPIO_InitStruct.Pin = GPIO_PIN_14;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    /* Configure PB12-PB15 as AF push-pull for SPI2 slave.
+       SCK/MOSI/NSS are inputs to the slave, MISO is output.
+       On STM32F1, all must be GPIO_MODE_AF_PP to connect to the SPI peripheral. */
+    GPIO_InitStruct.Pin = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     hspi2.Instance = SPI2;
@@ -77,7 +68,7 @@ void SPI_Slave_Init(void)
     /* Start with MODE0, we can sweep (0..3) at runtime via spi_mode_index if needed */
     hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
     hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
-    hspi2.Init.NSS = SPI_NSS_HARD_INPUT; /* use hardware NSS input */
+    hspi2.Init.NSS = SPI_NSS_SOFT; /* software NSS — always selected, no need for PB12 wiring */
     /* Raspberry Pi Linux spidev is MSB-first for 8-bit transfers */
     hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
     hspi2.Init.TIMode = SPI_TIMODE_DISABLE;

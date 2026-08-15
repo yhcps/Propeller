@@ -7,6 +7,12 @@
 static int16_t throttles[ESC_CHANNELS];
 static uint32_t last_frame_ms = 0;
 
+/* EMA 输出平滑滤波：防止抖动并压制输出峰值 */
+#define ESC_EMA_ALPHA_Q8  77     /* alpha ≈ 0.3 定点 Q8（77/256 ≈ 0.301）*/
+#define ESC_MAX_DELTA_US  100    /* 每帧最大跳变 100us，防瞬间大幅跳变 */
+static uint16_t esc_pwm_filtered[ESC_CHANNELS];  /* 滤波后的 PWM us */
+static uint8_t esc_filter_inited = 0;
+
 /* Debug variables */
 volatile uint8_t debug_pwm_initialized = 0;
 
@@ -92,6 +98,19 @@ void ESC_PWM_Init(void)
     /* Disable any TIM4 remapping - use default pins (PB6-PB9) */
     __HAL_AFIO_REMAP_TIM4_DISABLE();
 
+    /* Configure PB6-PB9 as AF push-pull for TIM4 PWM output */
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* Initialize EMA filter to mid (1500us) */
+    for (int i = 0; i < ESC_CHANNELS; i++) {
+        esc_pwm_filtered[i] = 1500;
+    }
+    esc_filter_inited = 1;
+
     /* Set initial pulse to mid (1500us) for all channels */
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1500);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 1500);
@@ -139,23 +158,49 @@ void ESC_SPI_Init(void)
     for (int i = 0; i < ESC_CHANNELS; ++i) throttles[i] = 0;
 }
 
-/* Helper: apply throttle to TIM PWM outputs. Map throttles (assumed -100..100) to pulse width 1ms..2ms (1000..2000us) */
+/* Helper: apply throttle to TIM PWM outputs with EMA smoothing filter.
+   Map throttles (-100..100) to pulse width 1000..2000us,
+   then apply EMA low-pass filter + rate limiter to suppress jitter and peaks. */
 void ESC_ApplyToPWM(void)
 {
-    uint32_t pulse_us;
+    uint32_t target_us;
     for (int i = 0; i < ESC_CHANNELS; ++i)
     {
         int16_t v = throttles[i];
         /* Support both -100..100 percentage or 1000..2000us direct pulse width */
         if (v >= -100 && v <= 100)
         {
-            pulse_us = (uint32_t)(1500 + (v * 5));
+            target_us = (uint32_t)(1500 + (v * 5));
         }
         else
         {
-            pulse_us = (uint32_t)v;
+            target_us = (uint32_t)v;
         }
-        Pwm_SetChannelInternal(i, pulse_us);
+        /* Clamp to valid range */
+        if (target_us < 1000) target_us = 1000;
+        if (target_us > 2000) target_us = 2000;
+
+        if (!esc_filter_inited) {
+            esc_pwm_filtered[i] = (uint16_t)target_us;
+        } else {
+            int32_t filtered = (int32_t)esc_pwm_filtered[i];
+            int32_t target = (int32_t)target_us;
+
+            /* EMA: filtered = alpha * target + (1-alpha) * filtered  (Q8 fixed-point) */
+            filtered = (ESC_EMA_ALPHA_Q8 * target + (256 - ESC_EMA_ALPHA_Q8) * filtered) >> 8;
+
+            /* Rate limiter: clamp delta to ±ESC_MAX_DELTA_US per frame */
+            int32_t delta = filtered - (int32_t)esc_pwm_filtered[i];
+            if (delta > ESC_MAX_DELTA_US) {
+                filtered = (int32_t)esc_pwm_filtered[i] + ESC_MAX_DELTA_US;
+            } else if (delta < -(int32_t)ESC_MAX_DELTA_US) {
+                filtered = (int32_t)esc_pwm_filtered[i] - ESC_MAX_DELTA_US;
+            }
+
+            esc_pwm_filtered[i] = (uint16_t)filtered;
+        }
+
+        Pwm_SetChannelInternal(i, esc_pwm_filtered[i]);
     }
 }
 
