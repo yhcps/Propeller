@@ -20,6 +20,11 @@ imu_ws/
 ├── gitd.py                  # git daemon OTA 脚本（Pi 侧）
 └── ota_push.py              # SFTP 增量推送 + 重启（Pi 侧，备用）
 ```
+## WEB前端网址
+
+电脑有线网卡地址网址：192.168.50.2
+192.168.50.1:8080
+
 
 ## 控制途径切换（SPI / ST-Link）
 
